@@ -24,8 +24,7 @@ use tracing::{error, info, warn};
 
 fn main() -> Result<()> {
     init_tracing();
-    let cli = Cli::parse();
-    match cli.command {
+    match Cli::parse().command {
         Commands::Start(args) => cmd_start(args),
         Commands::Stop => cmd_stop(),
         Commands::Status => cmd_status(),
@@ -46,83 +45,6 @@ fn init_tracing() {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_target(false)
         .init();
-}
-
-fn merge_args(base: Config, args: cli::StartArgs) -> Result<Config> {
-    let mut cfg = base;
-    if let Some(v) = args.interface {
-        cfg.interface = v;
-    }
-    if let Some(v) = args.ssid {
-        cfg.ssid = v;
-    }
-    if args.passphrase.is_some() {
-        cfg.passphrase = args.passphrase;
-    }
-    if let Some(v) = args.channel {
-        cfg.channel = v;
-    }
-    if let Some(v) = args.upstream {
-        cfg.upstream = Some(v);
-    }
-    if let Some(v) = args.country_code {
-        cfg.country_code = v;
-    }
-    if args.hidden {
-        cfg.hidden = true;
-    }
-    if args.ieee80211ac {
-        cfg.ieee80211ac = true;
-    }
-
-    if let Some(mode) = args.hw_mode {
-        cfg.hw_mode = match mode.to_lowercase().as_str() {
-            "b" => HwMode::B,
-            "g" => HwMode::G,
-            "a" => HwMode::A,
-            other => bail!("unknown hw_mode '{other}', expected b/g/a"),
-        };
-    }
-    if let Some(class) = args.network_class {
-        cfg.network_class = match class.to_lowercase().as_str() {
-            "a" => NetworkClass::A,
-            "b" => NetworkClass::B,
-            "c" => NetworkClass::C,
-            other => bail!("unknown network_class '{other}', expected a/b/c"),
-        };
-    }
-    Ok(cfg)
-}
-
-fn resolve_config(args: cli::StartArgs) -> Result<Config> {
-    let base = Config::load_xdg()?.unwrap_or_default();
-    let cfg = merge_args(base, args)?;
-    cfg.validate()?;
-    if cfg.interface.is_empty() {
-        bail!(
-            "interface is required — set it in ~/.config/heisspunk/config.toml \
-             or pass --interface"
-        );
-    }
-    if cfg.ssid.is_empty() {
-        bail!(
-            "ssid is required — set it in ~/.config/heisspunk/config.toml \
-             or pass --ssid"
-        );
-    }
-    Ok(cfg)
-}
-
-fn check_wireless_interface(iface: &str) -> Result<()> {
-    let phy = format!("/sys/class/net/{iface}/phy80211");
-    let wireless = format!("/sys/class/net/{iface}/wireless");
-    if !std::path::Path::new(&phy).exists() && !std::path::Path::new(&wireless).exists() {
-        bail!(
-            "'{iface}' is not a wireless interface.\n\
-             List wireless interfaces with: iw dev"
-        );
-    }
-    Ok(())
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -154,6 +76,72 @@ fn install_signal_handlers() -> Result<()> {
     Ok(())
 }
 
+fn merge_args(mut cfg: Config, args: cli::StartArgs) -> Result<Config> {
+    if let Some(v) = args.interface {
+        cfg.interface = v;
+    }
+    if let Some(v) = args.ssid {
+        cfg.ssid = v;
+    }
+    if let Some(v) = args.channel {
+        cfg.channel = v;
+    }
+    if let Some(v) = args.upstream {
+        cfg.upstream = Some(v);
+    }
+    if let Some(v) = args.country_code {
+        cfg.country_code = v;
+    }
+    if args.passphrase.is_some() {
+        cfg.passphrase = args.passphrase;
+    }
+    if args.hidden {
+        cfg.hidden = true;
+    }
+    if args.ieee80211ac {
+        cfg.ieee80211ac = true;
+    }
+
+    if let Some(mode) = args.hw_mode {
+        cfg.hw_mode = match mode.to_lowercase().as_str() {
+            "b" => HwMode::B,
+            "g" => HwMode::G,
+            "a" => HwMode::A,
+            other => bail!("unknown hw_mode '{other}', expected b/g/a"),
+        };
+    }
+    if let Some(class) = args.network_class {
+        cfg.network_class = match class.to_lowercase().as_str() {
+            "a" => NetworkClass::A,
+            "b" => NetworkClass::B,
+            "c" => NetworkClass::C,
+            other => bail!("unknown network_class '{other}', expected a/b/c"),
+        };
+    }
+    Ok(cfg)
+}
+
+fn resolve_config(args: cli::StartArgs) -> Result<Config> {
+    let cfg = merge_args(Config::load_xdg()?.unwrap_or_default(), args)?;
+    cfg.validate()?;
+    if cfg.interface.is_empty() {
+        bail!("interface is required — set it in config.toml or pass --interface");
+    }
+    if cfg.ssid.is_empty() {
+        bail!("ssid is required — set it in config.toml or pass --ssid");
+    }
+    Ok(cfg)
+}
+
+fn check_wireless_interface(iface: &str) -> Result<()> {
+    if !std::path::Path::new(&format!("/sys/class/net/{iface}/phy80211")).exists()
+        && !std::path::Path::new(&format!("/sys/class/net/{iface}/wireless")).exists()
+    {
+        bail!("'{iface}' is not a wireless interface — list interfaces with: iw dev");
+    }
+    Ok(())
+}
+
 fn cmd_start(args: cli::StartArgs) -> Result<()> {
     install_signal_handlers()?;
     let cfg = resolve_config(args.clone())?;
@@ -167,7 +155,7 @@ fn run_hotspot_loop(args: &cli::StartArgs, initial_cfg: Config, rt: &PathBuf) ->
     let mut cfg = initial_cfg;
     let mut restart_delay = Duration::from_secs(1);
     const MAX_DELAY: Duration = Duration::from_secs(30);
-    let mut svc_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let mut svc_stop = Arc::new(AtomicBool::new(false));
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -175,7 +163,6 @@ fn run_hotspot_loop(args: &cli::StartArgs, initial_cfg: Config, rt: &PathBuf) ->
         }
 
         if RELOAD.swap(false, Ordering::SeqCst) {
-            info!("SIGHUP — reloading config");
             match resolve_config(args.clone()) {
                 Ok(new) => {
                     cfg = new;
@@ -188,11 +175,20 @@ fn run_hotspot_loop(args: &cli::StartArgs, initial_cfg: Config, rt: &PathBuf) ->
         match start_session(&cfg, rt, Arc::clone(&svc_stop)) {
             Ok(mut hostapd) => {
                 restart_delay = Duration::from_secs(1);
-                log_running_summary(&cfg);
+                let gw = cfg.resolved_gateway();
+                let range = cfg.resolved_dhcp_range();
+                info!(
+                    ssid     = %cfg.ssid,
+                    iface    = %cfg.interface,
+                    security = if cfg.passphrase.is_some() { "WPA2" } else { "open" },
+                    gateway  = %gw,
+                    dhcp     = %format!("{} – {}", range.start, range.end),
+                    "hotspot running"
+                );
 
                 loop {
                     if SHUTDOWN.load(Ordering::SeqCst) {
-                        info!("shutdown signal received");
+                        info!("shutting down");
                         svc_stop.store(true, Ordering::SeqCst);
                         let _ = hostapd.kill();
                         let _ = hostapd.wait();
@@ -207,12 +203,8 @@ fn run_hotspot_loop(args: &cli::StartArgs, initial_cfg: Config, rt: &PathBuf) ->
                         let _ = hostapd.kill();
                         let _ = hostapd.wait();
                         teardown_hostapd(rt);
-                        match resolve_config(args.clone()) {
-                            Ok(new) => {
-                                cfg = new;
-                                info!("config reloaded");
-                            }
-                            Err(e) => warn!(err = %e, "config reload failed"),
+                        if let Ok(new) = resolve_config(args.clone()) {
+                            cfg = new;
                         }
                         svc_stop = Arc::new(AtomicBool::new(false));
                         break;
@@ -238,7 +230,6 @@ fn run_hotspot_loop(args: &cli::StartArgs, initial_cfg: Config, rt: &PathBuf) ->
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
         }
-
         info!(secs = restart_delay.as_secs(), "waiting before restart");
         interruptible_sleep(restart_delay);
         restart_delay = (restart_delay * 2).min(MAX_DELAY);
@@ -250,20 +241,18 @@ fn run_hotspot_loop(args: &cli::StartArgs, initial_cfg: Config, rt: &PathBuf) ->
 }
 
 fn start_session(cfg: &Config, rt: &PathBuf, stop: Arc<AtomicBool>) -> Result<std::process::Child> {
-    let hostapd_conf = rt.join("hostapd.conf");
-
     process::configure_interface(&cfg.interface, &cfg.resolved_gateway())?;
 
     let upstream = cfg.upstream.clone().or_else(|| {
-        let detected = detect_upstream();
-        if let Some(ref u) = detected {
-            if u != &cfg.interface {
+        detect_upstream().filter(|u| {
+            if u == &cfg.interface {
+                warn!("could not auto-detect upstream interface — NAT disabled");
+                false
+            } else {
                 info!(upstream = %u, "auto-detected upstream interface");
-                return detected;
+                true
             }
-        }
-        warn!("could not auto-detect upstream interface — NAT disabled");
-        None
+        })
     });
 
     if let Some(ref up) = upstream {
@@ -273,10 +262,28 @@ fn start_session(cfg: &Config, rt: &PathBuf, stop: Arc<AtomicBool>) -> Result<st
     spawn_dhcp_thread(cfg, Arc::clone(&stop))?;
     spawn_dns_thread(cfg, Arc::clone(&stop));
 
-    let hostapd = hostapd::spawn_with_fallback(cfg, &hostapd_conf)?;
+    let hostapd = hostapd::spawn_with_fallback(cfg, &rt.join("hostapd.conf"))?;
     process::write_pid_file(&rt.join("hostapd.pid"), hostapd.id())?;
-
     Ok(hostapd)
+}
+
+fn cleanup_nat(cfg: &Config) {
+    let upstream = cfg
+        .upstream
+        .clone()
+        .or_else(|| detect_upstream().filter(|u| u != &cfg.interface));
+    if let Some(ref up) = upstream {
+        let _ = process::disable_nat(up, &cfg.interface, &cfg.resolved_gateway());
+    }
+}
+
+fn interruptible_sleep(duration: Duration) {
+    let tick = Duration::from_millis(200);
+    let mut rem = duration;
+    while rem > Duration::ZERO && !SHUTDOWN.load(Ordering::SeqCst) {
+        std::thread::sleep(tick.min(rem));
+        rem = rem.saturating_sub(tick);
+    }
 }
 
 fn spawn_dhcp_thread(cfg: &Config, stop: Arc<AtomicBool>) -> Result<()> {
@@ -286,8 +293,8 @@ fn spawn_dhcp_thread(cfg: &Config, stop: Arc<AtomicBool>) -> Result<()> {
     let end: Ipv4Addr = range.end.parse().context("parsing DHCP range end")?;
     let mask: Ipv4Addr = range.netmask.parse().context("parsing subnet mask")?;
     let iface = cfg.interface.clone();
-
     let server = DhcpServer::new(gateway, start, end, mask, parse_lease_secs(&cfg.dhcp_lease));
+
     std::thread::Builder::new()
         .name("dhcp".into())
         .spawn(move || {
@@ -301,7 +308,7 @@ fn spawn_dhcp_thread(cfg: &Config, stop: Arc<AtomicBool>) -> Result<()> {
 
 fn spawn_dns_thread(cfg: &Config, stop: Arc<AtomicBool>) {
     let Ok(gateway) = cfg.resolved_gateway().parse::<Ipv4Addr>() else {
-        warn!("invalid gateway for DNS, skipping DNS forwarder");
+        warn!("invalid gateway — DNS forwarder disabled");
         return;
     };
     let iface = cfg.interface.clone();
@@ -315,39 +322,16 @@ fn spawn_dns_thread(cfg: &Config, stop: Arc<AtomicBool>) {
 }
 
 fn parse_lease_secs(s: &str) -> u32 {
-    if let Some(h) = s.strip_suffix('h') {
-        return h.parse::<u32>().unwrap_or(12) * 3600;
+    if let Some(n) = s.strip_suffix('h') {
+        return n.parse::<u32>().unwrap_or(12) * 3600;
     }
-    if let Some(m) = s.strip_suffix('m') {
-        return m.parse::<u32>().unwrap_or(30) * 60;
+    if let Some(n) = s.strip_suffix('m') {
+        return n.parse::<u32>().unwrap_or(30) * 60;
     }
-    if let Some(s) = s.strip_suffix('s') {
-        return s.parse::<u32>().unwrap_or(43200);
+    if let Some(n) = s.strip_suffix('s') {
+        return n.parse::<u32>().unwrap_or(43200);
     }
     s.parse::<u32>().unwrap_or(43200)
-}
-
-fn log_running_summary(cfg: &Config) {
-    let gateway = cfg.resolved_gateway();
-    let range = cfg.resolved_dhcp_range();
-    info!(
-        ssid     = %cfg.ssid,
-        iface    = %cfg.interface,
-        security = if cfg.passphrase.is_some() { "WPA2" } else { "open" },
-        gateway  = %gateway,
-        dhcp     = %format!("{} – {}", range.start, range.end),
-        "hotspot running"
-    );
-}
-
-fn cleanup_nat(cfg: &Config) {
-    let upstream = cfg
-        .upstream
-        .clone()
-        .or_else(|| detect_upstream().filter(|u| u != &cfg.interface));
-    if let Some(ref up) = upstream {
-        let _ = process::disable_nat(up, &cfg.interface, &cfg.resolved_gateway());
-    }
 }
 
 fn cmd_stop() -> Result<()> {
@@ -373,7 +357,7 @@ fn cmd_status() -> Result<()> {
 
 fn cmd_show(args: cli::StartArgs) -> Result<()> {
     let cfg = resolve_config(args)?;
-    let gateway = cfg.resolved_gateway();
+    let gw = cfg.resolved_gateway();
     let range = cfg.resolved_dhcp_range();
     println!("interface    : {}", cfg.interface);
     println!("ssid         : {}", cfg.ssid);
@@ -384,7 +368,7 @@ fn cmd_show(args: cli::StartArgs) -> Result<()> {
     println!("channel      : {}", cfg.channel);
     println!("hw_mode      : {}", cfg.hw_mode.as_str());
     println!("network_class: {:?}", cfg.network_class);
-    println!("gateway      : {gateway}");
+    println!("gateway      : {gw}");
     println!(
         "dhcp_range   : {} – {} / {}",
         range.start, range.end, range.netmask
@@ -392,7 +376,7 @@ fn cmd_show(args: cli::StartArgs) -> Result<()> {
     println!("dhcp_lease   : {}", cfg.dhcp_lease);
     println!(
         "upstream     : {}",
-        cfg.upstream.as_deref().unwrap_or("<none>")
+        cfg.upstream.as_deref().unwrap_or("<auto-detect>")
     );
     println!("hidden       : {}", cfg.hidden);
     println!("ieee80211n   : {}", cfg.ieee80211n);
@@ -402,86 +386,31 @@ fn cmd_show(args: cli::StartArgs) -> Result<()> {
 }
 
 fn cmd_generate_config(output: Option<PathBuf>) -> Result<()> {
-    let content = default_config_toml();
-    let path = match output {
-        Some(p) => p,
-        None => Config::config_path()?,
-    };
+    let path = output.map(Ok).unwrap_or_else(Config::config_path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(&path, &content).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(&path, DEFAULT_CONFIG).with_context(|| format!("writing {}", path.display()))?;
     println!("Config written to {}", path.display());
     Ok(())
 }
 
-fn default_config_toml() -> String {
-    r#"# heisspunk configuration file
-# All values shown are the built-in defaults.
-# Lines starting with '#' are comments.
-
-# Wireless interface to use as the access point (required).
-# Find yours with: iw dev
-interface = "wlan0"
-
-# SSID to broadcast (required, 1–32 characters).
-ssid = "MyHotspot"
-
-# WPA2 passphrase (8–63 characters).
-# Remove or comment out this line to create an open (unencrypted) network.
-# passphrase = "secret123"
-
-# WiFi channel number.
-# 2.4 GHz: 1–13  |  5 GHz: 36, 40, 44, 48, 52, ...
-channel = 6
-
-# Hardware mode: "b", "g" (2.4 GHz), or "a" (5 GHz).
-hw_mode = "g"
-
-# RFC 1918 private network class used to derive the gateway and DHCP range.
-# Overridden by explicit 'gateway' and 'dhcp_range' below.
-#   "a" → 10.0.0.0/8      gateway 10.0.0.1
-#   "b" → 172.16.0.0/12   gateway 172.16.0.1
-#   "c" → 192.168.x.0/24  gateway 192.168.100.1  (default)
-network_class = "c"
-
-# Override the gateway IP derived from network_class.
-# gateway = "192.168.100.1"
-
-# Override the DHCP pool derived from network_class.
+const DEFAULT_CONFIG: &str = "\
+interface = \"wlan0\"       # wireless AP interface — find yours with: iw dev
+ssid = \"MyHotspot\"        # 1–32 characters
+passphrase = \"secret\"   # WPA2-PSK, 8–63 chars; omit for open network
+channel = 6                 # 2.4 GHz: 1–13 | 5 GHz: 36 40 44 48 52 ...
+hw_mode = \"g\"             # b/g = 2.4 GHz, a = 5 GHz
+network_class = \"c\"       # RFC 1918 defaults — a=10/8, b=172.16/12, c=192.168/24
+# gateway = \"192.168.100.1\"
 # [dhcp_range]
-# start   = "192.168.100.10"
-# end     = "192.168.100.250"
-# netmask = "255.255.255.0"
-
-# DHCP lease duration.  Suffixes: h (hours), m (minutes), s (seconds).
-dhcp_lease = "12h"
-
-# Upstream interface for NAT / internet sharing.
-# Remove or comment out to disable NAT (isolated hotspot only).
-# upstream = "eth0"
-
-# Hide the SSID — clients must know it to connect.
-hidden = false
-
-# IEEE 802.11n (HT, up to 300 Mbps on 2.4/5 GHz).
-ieee80211n = true
-
-# IEEE 802.11ac (VHT, 5 GHz only).  Requires hw_mode = "a".
-ieee80211ac = false
-
-# ISO 3166-1 alpha-2 country code for regulatory domain.
-# Controls which channels and power levels are legal to use.
-country_code = "DE"
-"#
-    .to_string()
-}
-
-fn interruptible_sleep(duration: Duration) {
-    let tick = Duration::from_millis(200);
-    let mut remaining = duration;
-    while remaining > Duration::ZERO && !SHUTDOWN.load(Ordering::SeqCst) {
-        std::thread::sleep(tick.min(remaining));
-        remaining = remaining.saturating_sub(tick);
-    }
-}
+# start   = \"192.168.100.10\"
+# end     = \"192.168.100.250\"
+# netmask = \"255.255.255.0\"
+dhcp_lease = \"12h\"        # suffixes: h m s
+# upstream = \"eth0\"       # interface for NAT/masquerade; auto-detected if omitted
+hidden = false              # suppress SSID beacon
+ieee80211n = true           # HT, up to 300 Mbps
+ieee80211ac = false         # VHT 5 GHz only; channel width auto-detected from driver
+country_code = \"CH\"       # ISO 3166-1 alpha-2, controls legal channels/power
+";
