@@ -46,10 +46,6 @@ impl PhyCaps {
             _ => {}
         }
 
-        if c & 0x0010 != 0 {
-            s.push_str("[GF]");
-        }
-
         if c & 0x0020 != 0 {
             s.push_str("[SHORT-GI-20]");
         }
