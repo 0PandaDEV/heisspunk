@@ -8,33 +8,12 @@ use tracing::{debug, info, warn};
 
 pub fn configure_interface(interface: &str, gateway: &str) -> Result<()> {
     which("ip")?;
-    info!(interface, "flushing interface addresses");
-    let status = Command::new("ip")
-        .args(["addr", "flush", "dev", interface])
-        .status()
-        .context("flushing interface address")?;
-    if !status.success() {
-        bail!("ip addr flush failed");
-    }
-
     let cidr = gateway_to_cidr(gateway)?;
-    info!(interface, cidr, "assigning address");
-    let status = Command::new("ip")
-        .args(["addr", "add", &cidr, "dev", interface])
-        .status()
-        .context("assigning interface address")?;
-    if !status.success() {
-        bail!("ip addr add failed");
-    }
+    info!(interface, cidr, "configuring AP interface");
 
-    let status = Command::new("ip")
-        .args(["link", "set", interface, "up"])
-        .status()
-        .context("bringing interface up")?;
-    if !status.success() {
-        bail!("ip link set up failed");
-    }
-
+    run("ip", &["addr", "flush", "dev", interface]).context("ip addr flush")?;
+    run("ip", &["addr", "add", &cidr, "dev", interface]).context("ip addr add")?;
+    run("ip", &["link", "set", interface, "up"]).context("ip link set up")?;
     Ok(())
 }
 
@@ -43,24 +22,19 @@ pub fn detect_upstream() -> Option<String> {
         .args(["route", "show", "default"])
         .output()
         .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
-    let mut iter = stdout.split_whitespace();
-    while let Some(tok) = iter.next() {
-        if tok == "dev" {
-            return iter.next().map(str::to_owned);
-        }
-    }
-    None
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .skip_while(|&t| t != "dev")
+        .nth(1)
+        .map(str::to_owned)
 }
 
-pub fn enable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<()> {
+pub fn enable_nat(upstream: &str, ap_iface: &str, gateway: &str) -> Result<()> {
     which("iptables")?;
-    info!(upstream, ap_interface, "enabling NAT / IP forwarding");
+    let subnet = gateway_to_subnet(gateway)?;
+    info!(upstream, ap_iface, subnet, "enabling NAT");
 
     fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enabling ip_forward")?;
-
-    let subnet = gateway_to_subnet(gateway)?;
 
     ipt(&[
         "-t",
@@ -76,16 +50,7 @@ pub fn enable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<(
     ])?;
 
     ipt(&[
-        "-A",
-        "FORWARD",
-        "-i",
-        ap_interface,
-        "-o",
-        upstream,
-        "-s",
-        &subnet,
-        "-j",
-        "ACCEPT",
+        "-A", "FORWARD", "-i", ap_iface, "-o", upstream, "-s", &subnet, "-j", "ACCEPT",
     ])?;
 
     ipt(&[
@@ -94,7 +59,7 @@ pub fn enable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<(
         "-i",
         upstream,
         "-o",
-        ap_interface,
+        ap_iface,
         "-d",
         &subnet,
         "-m",
@@ -104,14 +69,10 @@ pub fn enable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<(
         "-j",
         "ACCEPT",
     ])?;
-
-    info!(upstream, subnet, "NAT enabled");
     Ok(())
 }
 
-pub fn disable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<()> {
-    info!(upstream, "removing NAT rules");
-
+pub fn disable_nat(upstream: &str, ap_iface: &str, gateway: &str) -> Result<()> {
     let subnet = match gateway_to_subnet(gateway) {
         Ok(s) => s,
         Err(e) => {
@@ -119,6 +80,7 @@ pub fn disable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<
             return Ok(());
         }
     };
+    info!(upstream, "removing NAT rules");
 
     let _ = ipt(&[
         "-t",
@@ -133,16 +95,7 @@ pub fn disable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<
         "MASQUERADE",
     ]);
     let _ = ipt(&[
-        "-D",
-        "FORWARD",
-        "-i",
-        ap_interface,
-        "-o",
-        upstream,
-        "-s",
-        &subnet,
-        "-j",
-        "ACCEPT",
+        "-D", "FORWARD", "-i", ap_iface, "-o", upstream, "-s", &subnet, "-j", "ACCEPT",
     ]);
     let _ = ipt(&[
         "-D",
@@ -150,7 +103,7 @@ pub fn disable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<
         "-i",
         upstream,
         "-o",
-        ap_interface,
+        ap_iface,
         "-d",
         &subnet,
         "-m",
@@ -160,24 +113,11 @@ pub fn disable_nat(upstream: &str, ap_interface: &str, gateway: &str) -> Result<
         "-j",
         "ACCEPT",
     ]);
-
-    Ok(())
-}
-
-fn ipt(args: &[&str]) -> Result<()> {
-    let status = Command::new("iptables")
-        .args(args)
-        .status()
-        .with_context(|| format!("iptables {}", args.join(" ")))?;
-    if !status.success() {
-        bail!("iptables {} failed", args.join(" "));
-    }
     Ok(())
 }
 
 pub fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
-    fs::create_dir_all(path.parent().unwrap_or(Path::new("/tmp")))
-        .context("creating pid directory")?;
+    fs::create_dir_all(path.parent().unwrap_or(Path::new("/tmp"))).context("creating pid dir")?;
     fs::write(path, pid.to_string()).context("writing pid file")
 }
 
@@ -185,22 +125,23 @@ pub fn kill_from_pid_file(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let raw = fs::read_to_string(path).context("reading pid file")?;
-    let pid: i32 = raw.trim().parse().context("parsing pid")?;
-    debug!(pid, path = %path.display(), "sending SIGTERM");
+    let pid: i32 = fs::read_to_string(path)
+        .context("reading pid file")?
+        .trim()
+        .parse()
+        .context("parsing pid")?;
+    debug!(pid, "sending SIGTERM to hostapd");
     let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
     let _ = fs::remove_file(path);
     Ok(())
 }
 
 pub fn pid_is_running(pid_file: &Path) -> bool {
-    let Ok(raw) = fs::read_to_string(pid_file) else {
-        return false;
-    };
-    let Ok(pid) = raw.trim().parse::<i32>() else {
-        return false;
-    };
-    signal::kill(Pid::from_raw(pid), None).is_ok()
+    fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .map(|pid| signal::kill(Pid::from_raw(pid), None).is_ok())
+        .unwrap_or(false)
 }
 
 pub fn teardown_hostapd(rt: &Path) {
@@ -213,24 +154,39 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from("/tmp/heisspunk")
 }
 
+fn run(cmd: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("{cmd} {}", args.join(" ")))?;
+    if !status.success() {
+        bail!("{cmd} {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+fn ipt(args: &[&str]) -> Result<()> {
+    run("iptables", args)
+}
+
 fn which(cmd: &str) -> Result<()> {
-    let found = Command::new("which")
+    if !Command::new("which")
         .arg(cmd)
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !found {
-        bail!("{cmd} not found in PATH — please install it");
+        .unwrap_or(false)
+    {
+        bail!("{cmd} not found in PATH");
     }
     Ok(())
 }
 
 fn gateway_to_cidr(gateway: &str) -> Result<String> {
-    let parts: Vec<&str> = gateway.split('.').collect();
-    if parts.len() != 4 {
+    let p: Vec<&str> = gateway.split('.').collect();
+    if p.len() != 4 {
         bail!("invalid gateway IP: {gateway}");
     }
-    let prefix = match parts[0] {
+    let prefix = match p[0] {
         "10" => 8,
         "172" => 12,
         _ => 24,
@@ -239,14 +195,14 @@ fn gateway_to_cidr(gateway: &str) -> Result<String> {
 }
 
 fn gateway_to_subnet(gateway: &str) -> Result<String> {
-    let parts: Vec<&str> = gateway.split('.').collect();
-    if parts.len() != 4 {
+    let p: Vec<&str> = gateway.split('.').collect();
+    if p.len() != 4 {
         bail!("invalid gateway IP: {gateway}");
     }
-    let prefix = match parts[0] {
+    let prefix = match p[0] {
         "10" => 8,
         "172" => 12,
         _ => 24,
     };
-    Ok(format!("{}.{}.{}.0/{prefix}", parts[0], parts[1], parts[2]))
+    Ok(format!("{}.{}.{}.0/{prefix}", p[0], p[1], p[2]))
 }
