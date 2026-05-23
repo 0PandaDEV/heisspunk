@@ -1,22 +1,28 @@
 use anyhow::{Context, Result};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 const DNS_PORT: u16 = 53;
-const UPSTREAM: &str = "1.1.1.1:53";
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct DnsForwarder {
     listen: SocketAddrV4,
+    upstream: SocketAddr,
 }
 
 impl DnsForwarder {
     pub fn new(gateway: Ipv4Addr) -> Self {
+        let upstream = system_dns_server().unwrap_or_else(|| {
+            warn!("could not detect system DNS, falling back to 1.1.1.1");
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), DNS_PORT)
+        });
+        info!(upstream = %upstream, "DNS forwarder will use upstream resolver");
         Self {
             listen: SocketAddrV4::new(gateway, DNS_PORT),
+            upstream,
         }
     }
 
@@ -27,7 +33,7 @@ impl DnsForwarder {
             .context("setting read timeout")?;
         bind_to_device(&sock, iface)?;
 
-        info!(addr = %self.listen, upstream = UPSTREAM, "DNS forwarder listening");
+        info!(addr = %self.listen, upstream = %self.upstream, "DNS forwarder listening");
 
         let mut buf = [0u8; 512];
         loop {
@@ -35,19 +41,15 @@ impl DnsForwarder {
                 break;
             }
             match sock.recv_from(&mut buf) {
-                Ok((n, client)) => {
-                    let query = buf[..n].to_vec();
-                    let upstream: SocketAddr = UPSTREAM.parse().unwrap();
-                    match forward_query(&query, upstream) {
-                        Ok(resp) => {
-                            if let Err(e) = sock.send_to(&resp, client) {
-                                warn!(err = %e, "DNS send to client failed");
-                            }
-                            debug!(client = %client, "DNS query forwarded");
+                Ok((n, client)) => match forward_query(&buf[..n], self.upstream) {
+                    Ok(resp) => {
+                        if let Err(e) = sock.send_to(&resp, client) {
+                            warn!(err = %e, "DNS send to client failed");
                         }
-                        Err(e) => warn!(err = %e, "DNS forward failed"),
+                        debug!(client = %client, "DNS query forwarded");
                     }
-                }
+                    Err(e) => warn!(err = %e, "DNS forward failed"),
+                },
                 Err(ref e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -58,6 +60,17 @@ impl DnsForwarder {
         info!("DNS forwarder stopped");
         Ok(())
     }
+}
+
+fn system_dns_server() -> Option<SocketAddr> {
+    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    content
+        .lines()
+        .filter(|l| l.starts_with("nameserver"))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter_map(|addr| addr.parse::<IpAddr>().ok())
+        .find(IpAddr::is_ipv4)
+        .map(|ip| SocketAddr::new(ip, DNS_PORT))
 }
 
 fn forward_query(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
@@ -74,11 +87,10 @@ fn forward_query(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
 
 fn bind_to_device(sock: &UdpSocket, iface: &str) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    let fd = sock.as_raw_fd();
     let name = std::ffi::CString::new(iface).context("interface name")?;
     let ret = unsafe {
         libc::setsockopt(
-            fd,
+            sock.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_BINDTODEVICE,
             name.as_ptr() as *const libc::c_void,
